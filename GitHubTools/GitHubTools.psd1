@@ -9,7 +9,7 @@
 
     PowerShellVersion = '5.1'
 
-    FunctionsToExport = @('Get-GitHubWorkflowStatus', 'Get-GitHubPullRequest')
+    FunctionsToExport = @('Get-GitHubWorkflowStatus', 'Get-GitHubPullRequest', 'Invoke-GitHubWorkflow')
     CmdletsToExport   = @()
     VariablesToExport = @()
     AliasesToExport   = @()

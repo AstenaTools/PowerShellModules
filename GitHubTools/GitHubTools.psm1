@@ -50,6 +50,45 @@ function Get-JsonProperty {
     return $property.Value
 }
 
+function Get-GitHubRepositoryName {
+    <#
+        .SYNOPSIS
+            Returns the 'owner/name' of every repository in an organization.
+
+        .DESCRIPTION
+            Private helper shared by the public functions. Callers should wrap the result in @() —
+            an organization with no matching repositories emits nothing at all.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Organization,
+
+        [int]$Limit = 500,
+
+        [switch]$IncludeArchived
+    )
+
+    $repoArgs = @(
+        'repo', 'list', $Organization,
+        '--limit', $Limit,
+        '--json', 'nameWithOwner',
+        '-q', '.[].nameWithOwner'
+    )
+    if (-not $IncludeArchived) { $repoArgs += '--no-archived' }
+
+    Write-Verbose "gh $($repoArgs -join ' ')"
+
+    $names = @(gh @repoArgs)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to list repositories for organization '$Organization'. Check the name and your 'gh' permissions."
+    }
+
+    # Filter blanks so a trailing newline from gh cannot become a phantom repository.
+    $names | Where-Object { $_ -and $_.Trim() }
+}
+
 function Get-GitHubWorkflowStatus {
     <#
         .SYNOPSIS
@@ -148,14 +187,7 @@ function Get-GitHubWorkflowStatus {
     }
 
     process {
-        $repoArgs = @('repo', 'list', $org, '--limit', $Limit, '--json', 'nameWithOwner', '-q', '.[].nameWithOwner')
-        if (-not $IncludeArchived) { $repoArgs += '--no-archived' }
-
-        $repos = @(gh @repoArgs)
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to list repositories for organization '$org'. Check the name and your 'gh' permissions."
-        }
-
+        $repos = @(Get-GitHubRepositoryName -Organization $org -Limit $Limit -IncludeArchived:$IncludeArchived)
         Write-Verbose "Found $($repos.Count) repositories in '$org'."
 
         $i = 0
@@ -470,4 +502,255 @@ function Get-GitHubPullRequest {
     }
 }
 
-Export-ModuleMember -Function 'Get-GitHubWorkflowStatus', 'Get-GitHubPullRequest'
+function Invoke-GitHubWorkflow {
+    <#
+        .SYNOPSIS
+            Runs a workflow in every repository of an organization that has it.
+
+        .DESCRIPTION
+            Walks the repositories of an organization, checks whether the named workflow exists and is
+            active, and dispatches it where it does. Repositories without the workflow are skipped
+            rather than treated as failures.
+
+            No workflow inputs are supplied, so every input takes the default value declared in the
+            workflow YAML. A workflow with a required input that has no default cannot be dispatched
+            this way and is reported as Failed with the reason returned by GitHub.
+
+            This function CHANGES STATE — it starts real CI runs, potentially hundreds of them — so it
+            supports -WhatIf and prompts for confirmation by default. Use -WhatIf first to see the
+            target list, and -Force to dispatch without prompting.
+
+            The workflow must declare a 'workflow_dispatch' trigger, otherwise GitHub refuses the
+            dispatch and the repository is reported as Failed.
+
+        .PARAMETER wf
+            The workflow file name or ID to run, e.g. 'ci.yml'. Aliased as -Workflow.
+
+        .PARAMETER org
+            The GitHub organization (or user) whose repositories are targeted. Aliased as -Organization.
+
+        .PARAMETER Ref
+            The branch or tag to run the workflow on. Defaults to each repository's own default branch,
+            which is usually what you want across an organization where branch names differ.
+
+        .PARAMETER Repository
+            Only consider these repositories, given as 'owner/name'. Useful for a trial run against
+            one or two repositories before dispatching to the whole organization.
+
+        .PARAMETER Limit
+            Maximum number of repositories to enumerate. Defaults to 500.
+
+        .PARAMETER IncludeArchived
+            Include archived repositories, which are excluded by default. Archived repositories cannot
+            run workflows, so this is rarely useful.
+
+        .PARAMETER DelayMilliseconds
+            Pause between dispatches, 200 ms by default. GitHub applies secondary rate limits to
+            write operations, and dispatching to a few hundred repositories without a pause can trip
+            them. Set to 0 to disable.
+
+        .PARAMETER Force
+            Dispatch without prompting for confirmation. Equivalent to -Confirm:$false.
+
+        .PARAMETER Format
+            How to render the result.
+
+            Object  Emit one object per repository (default). Fully pipeable.
+            Table   Render as a table, equivalent to piping to Format-Table -AutoSize.
+            List    Render as a list, one property per line.
+
+            Table and List produce display output rather than data: the result cannot be piped into
+            Where-Object, Sort-Object or Export-Csv afterwards.
+
+        .EXAMPLE
+            Invoke-GitHubWorkflow -wf 'ci.yml' -org 'OxygenTools' -WhatIf
+
+            Show which repositories would have 'ci.yml' dispatched, without starting anything.
+            Always worth running first.
+
+        .EXAMPLE
+            Invoke-GitHubWorkflow -wf 'ci.yml' -org 'OxygenTools' -Format Table
+
+            Dispatch after confirming, and print the outcome per repository.
+
+        .EXAMPLE
+            Invoke-GitHubWorkflow -wf 'ci.yml' -org 'OxygenTools' -Repository 'OxygenTools/AppA' -Force
+
+            Trial run against a single repository with no prompt.
+
+        .EXAMPLE
+            Invoke-GitHubWorkflow -wf 'ci.yml' -org 'OxygenTools' -Force |
+                Where-Object Action -eq 'Failed'
+
+            Dispatch everywhere and report only the repositories that refused.
+
+        .OUTPUTS
+            PSCustomObject with the properties Repo, Workflow, Action, Ref and Reason.
+            Action is one of Dispatched, Skipped, Failed or WhatIf.
+
+        .LINK
+            Get-GitHubWorkflowStatus
+    #>
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [Alias('Workflow')]
+        [string]$wf,
+
+        [Parameter(Mandatory, Position = 1)]
+        [ValidateNotNullOrEmpty()]
+        [Alias('Organization')]
+        [string]$org,
+
+        [ValidateNotNullOrEmpty()]
+        [Alias('Branch')]
+        [string]$Ref,
+
+        [string[]]$Repository,
+
+        [ValidateRange(1, 1000)]
+        [int]$Limit = 500,
+
+        [switch]$IncludeArchived,
+
+        [ValidateRange(0, 60000)]
+        [int]$DelayMilliseconds = 200,
+
+        [switch]$Force,
+
+        [ValidateSet('Object', 'Table', 'List')]
+        [string]$Format = 'Object'
+    )
+
+    begin {
+        Assert-GhCli
+
+        # -Force implies -Confirm:$false, but never overrides an explicit -Confirm.
+        if ($Force -and -not $PSBoundParameters.ContainsKey('Confirm')) {
+            $ConfirmPreference = 'None'
+        }
+
+        $buffer = $null
+        if ($Format -ne 'Object') {
+            $buffer = [System.Collections.Generic.List[object]]::new()
+        }
+    }
+
+    process {
+        if ($Repository) {
+            $repos = @($Repository)
+            Write-Verbose "Targeting $($repos.Count) explicitly named repositories."
+        }
+        else {
+            $repos = @(Get-GitHubRepositoryName -Organization $org -Limit $Limit -IncludeArchived:$IncludeArchived)
+            Write-Verbose "Found $($repos.Count) repositories in '$org'."
+        }
+
+        if ($repos.Count -eq 0) {
+            Write-Warning "No repositories found for organization '$org'."
+            return
+        }
+
+        $i = 0
+        foreach ($repo in $repos) {
+            $i++
+            Write-Progress -Activity "Dispatching '$wf'" -Status $repo -PercentComplete ($i / [Math]::Max($repos.Count, 1) * 100)
+
+            $action = 'Skipped'
+            $reason = ''
+
+            # Look the workflow up first, so a repository that simply does not have it is skipped
+            # quietly instead of counting as a failure.
+            $lookup = (gh api "repos/$repo/actions/workflows/$wf" 2>$null) -join "`n"
+
+            if ($LASTEXITCODE -ne 0 -or -not $lookup) {
+                $reason = "workflow '$wf' not found"
+            }
+            else {
+                $definition = $null
+                try { $definition = $lookup | ConvertFrom-Json } catch { }
+
+                $state = Get-JsonProperty $definition 'state' ''
+
+                if (-not $state) {
+                    $reason = 'could not read the workflow definition'
+                }
+                elseif ($state -ne 'active') {
+                    # A disabled workflow accepts no dispatch; saying so beats a raw API error.
+                    $reason = "workflow is '$state', not active"
+                }
+                elseif (-not $PSCmdlet.ShouldProcess($repo, "Run workflow '$wf'$(if ($Ref) { " on ref '$Ref'" })")) {
+                    $action = 'WhatIf'
+                    $reason = 'not dispatched'
+                }
+                else {
+                    $runArgs = @('workflow', 'run', $wf, '--repo', $repo)
+                    if ($Ref) { $runArgs += @('--ref', $Ref) }
+
+                    # '--json' with an empty object on stdin keeps gh non-interactive: without it gh
+                    # prompts for any declared input, which would hang a run across many repositories.
+                    # An empty object also means every input keeps its declared default.
+                    $runArgs += '--json'
+
+                    Write-Verbose "gh $($runArgs -join ' ')"
+
+                    $stderr     = ''
+                    $exitCode   = 0
+                    $stderrFile = [IO.Path]::GetTempFileName()
+
+                    try {
+                        '{}' | & gh @runArgs 2>$stderrFile | Out-Null
+                        $exitCode = $LASTEXITCODE
+                        $stderr = (Get-Content -LiteralPath $stderrFile -Raw -ErrorAction SilentlyContinue)
+                    }
+                    finally {
+                        Remove-Item -LiteralPath $stderrFile -Force -ErrorAction SilentlyContinue
+                    }
+
+                    if ($exitCode -eq 0) {
+                        $action = 'Dispatched'
+                        $reason = ''
+                    }
+                    else {
+                        $action = 'Failed'
+                        $reason = if ($stderr) {
+                            (($stderr -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -First 1).Trim()
+                        }
+                        else {
+                            "gh exited with code $exitCode"
+                        }
+                    }
+
+                    if ($DelayMilliseconds -gt 0) {
+                        Start-Sleep -Milliseconds $DelayMilliseconds
+                    }
+                }
+            }
+
+            $record = [pscustomobject]@{
+                Repo     = $repo
+                Workflow = $wf
+                Action   = $action
+                Ref      = if ($Ref) { $Ref } else { '(default branch)' }
+                Reason   = $reason
+            }
+
+            if ($null -eq $buffer) { $record } else { $buffer.Add($record) }
+        }
+
+        Write-Progress -Activity "Dispatching '$wf'" -Completed
+    }
+
+    end {
+        if ($null -eq $buffer) { return }
+
+        switch ($Format) {
+            'Table' { $buffer | Format-Table -AutoSize }
+            'List'  { $buffer | Format-List }
+        }
+    }
+}
+
+Export-ModuleMember -Function 'Get-GitHubWorkflowStatus', 'Get-GitHubPullRequest', 'Invoke-GitHubWorkflow'
