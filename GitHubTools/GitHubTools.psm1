@@ -171,18 +171,25 @@ function Get-GitHubWorkflowStatus {
                 $when   = $null
             }
             else {
-                $runs = $json | ConvertFrom-Json
+                $runs = $null
+                try { $runs = $json | ConvertFrom-Json } catch { }
 
-                if ($runs.total_count -eq 0) {
+                # Read through Get-JsonProperty: under Set-StrictMode -Version Latest a missing
+                # property is a terminating error, and a non-JSON body would take out the whole run.
+                $workflowRuns = @(Get-JsonProperty $runs 'workflow_runs' @())
+
+                if ($workflowRuns.Count -eq 0) {
                     $status = 'never run'
                     $branch = ''
                     $when   = $null
                 }
                 else {
-                    $run    = $runs.workflow_runs[0]
-                    $status = if ($run.conclusion) { $run.conclusion } else { $run.status }
-                    $branch = $run.head_branch
-                    $when   = $run.updated_at -as [datetime]
+                    $run    = $workflowRuns[0]
+                    $status = Get-JsonProperty $run 'conclusion'
+                    if (-not $status) { $status = Get-JsonProperty $run 'status' 'unknown' }
+                    $branch = Get-JsonProperty $run 'head_branch' ''
+                    $when   = Get-JsonProperty $run 'updated_at'
+                    $when   = if ($when) { $when -as [datetime] } else { $null }
                 }
             }
 
@@ -356,14 +363,51 @@ function Get-GitHubPullRequest {
             $searchArgs += @('--label', $name)
         }
 
-        Write-Verbose "gh $($searchArgs -join ' ')"
+        $command = "gh $($searchArgs -join ' ')"
+        Write-Verbose $command
 
-        $output = (gh @searchArgs 2>&1) -join "`n"
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to search pull requests in '$org'. Check the organization name and your 'gh' permissions.`n$output"
+        $raw        = $null
+        $exitCode   = 0
+        $stderr     = ''
+        $stderrFile = [IO.Path]::GetTempFileName()
+
+        try {
+            # stderr goes to a file rather than being merged in with 2>&1. gh writes update
+            # notices and auth warnings to stderr, and merging those into stdout corrupts the
+            # JSON payload.
+            $raw = & gh @searchArgs 2>$stderrFile
+            $exitCode = $LASTEXITCODE
+            $stderr = (Get-Content -LiteralPath $stderrFile -Raw -ErrorAction SilentlyContinue)
+        }
+        finally {
+            Remove-Item -LiteralPath $stderrFile -Force -ErrorAction SilentlyContinue
         }
 
-        $found = @($output | ConvertFrom-Json)
+        if ($exitCode -ne 0) {
+            throw "gh exited with code $exitCode while searching pull requests in '$org'. Check the organization name and your 'gh' permissions.`nCommand: $command`n$stderr"
+        }
+
+        $output = ($raw -join "`n").Trim()
+
+        if ($stderr) { Write-Verbose "gh stderr: $stderr" }
+
+        # Report an unusable response instead of quietly treating it as an empty result set.
+        if (-not $output) {
+            throw "gh returned no output while searching pull requests in '$org'.`nCommand: $command`n$stderr"
+        }
+
+        try {
+            $parsed = $output | ConvertFrom-Json
+        }
+        catch {
+            $snippet = if ($output.Length -gt 400) { $output.Substring(0, 400) + '...' } else { $output }
+            throw "gh returned output that is not valid JSON while searching pull requests in '$org'.`nCommand: $command`nOutput: $snippet`n$stderr"
+        }
+
+        # ConvertFrom-Json yields $null for a 'null' payload, and @($null) is a ONE-element
+        # array, which would surface as a row of empty properties. Drop those entries so an
+        # empty result set really is empty.
+        $found = @($parsed | Where-Object { $null -ne $_ })
         Write-Verbose "Found $($found.Count) pull request(s) in '$org'."
 
         if ($found.Count -ge $Limit) {
