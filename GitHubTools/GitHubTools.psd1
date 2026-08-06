@@ -17,7 +17,7 @@
     PrivateData = @{
         PSData = @{
             Tags       = @('GitHub', 'Actions', 'Workflow', 'gh', 'CI')
-            ProjectUri = 'https://github.com/Astena/GitHubPowerShellModules'
+            ProjectUri = 'https://github.com/OxygenTools/GitHubPowerShellModules'
         }
     }
 }
