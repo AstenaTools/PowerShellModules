@@ -157,6 +157,21 @@ function Resolve-ClaudeConfigPath {
     }
 }
 
+function Test-JsonProperty {
+    <# Returns $true when $InputObject carries a property called $Name.
+
+       Deliberately indexes the member collection instead of testing
+       "$InputObject.PSObject.Properties.Name -contains $Name": that form relies
+       on member enumeration, which throws PropertyNotFoundStrict under
+       Set-StrictMode when the object has no properties at all - exactly the case
+       for a freshly created config. Indexing returns $null instead. #>
+    param(
+        [Parameter(Mandatory)] $InputObject,
+        [Parameter(Mandatory)] [string] $Name
+    )
+    return ($null -ne $InputObject.PSObject.Properties[$Name])
+}
+
 function Set-JsonProperty {
     <# Adds or overwrites a property on a PSCustomObject (PS 5.1 friendly). #>
     param(
@@ -164,12 +179,110 @@ function Set-JsonProperty {
         [Parameter(Mandatory)] [string] $Name,
         [Parameter(Mandatory)] $Value
     )
-    if ($InputObject.PSObject.Properties.Name -contains $Name) {
+    if (Test-JsonProperty -InputObject $InputObject -Name $Name) {
         $InputObject.$Name = $Value
     }
     else {
         $InputObject | Add-Member -MemberType NoteProperty -Name $Name -Value $Value
     }
+}
+
+function ConvertTo-JsonString {
+    <# Quotes and escapes one JSON string value. #>
+    param([Parameter(Mandatory)] [AllowEmptyString()] [string] $Text)
+
+    $sb = New-Object System.Text.StringBuilder
+    [void] $sb.Append('"')
+
+    foreach ($ch in $Text.ToCharArray()) {
+        switch ($ch) {
+            '"'  { [void] $sb.Append('\"'); continue }
+            '\'  { [void] $sb.Append('\\'); continue }
+            "`b" { [void] $sb.Append('\b'); continue }
+            "`f" { [void] $sb.Append('\f'); continue }
+            "`n" { [void] $sb.Append('\n'); continue }
+            "`r" { [void] $sb.Append('\r'); continue }
+            "`t" { [void] $sb.Append('\t'); continue }
+            default {
+                if ([int] $ch -lt 0x20) {
+                    [void] $sb.Append(('\u{0:x4}' -f [int] $ch))
+                }
+                else {
+                    [void] $sb.Append($ch)
+                }
+            }
+        }
+    }
+
+    [void] $sb.Append('"')
+    return $sb.ToString()
+}
+
+function ConvertTo-JsonText {
+    <# Serialises $Value as JSON with two-space indentation and LF newlines.
+
+       ConvertTo-Json is deliberately not used for the document. Windows
+       PowerShell 5.1 pads every value into an aligned column, which is valid
+       JSON but looks nothing like the file PowerShell 7 or Claude Desktop
+       itself writes, so the config ended up formatted differently depending on
+       which shell ran the installer. This emitter produces identical output on
+       every supported version. #>
+    param(
+        $Value,
+        [int] $Level = 0
+    )
+
+    $nl = "`n"
+    $indent = '  ' * $Level
+    $inner = '  ' * ($Level + 1)
+
+    if ($null -eq $Value) { return 'null' }
+
+    if ($Value -is [bool]) {
+        if ($Value) { return 'true' }
+        return 'false'
+    }
+
+    if ($Value -is [string] -or $Value -is [char]) {
+        return (ConvertTo-JsonString -Text ([string] $Value))
+    }
+
+    # [short] is not a type accelerator in Windows PowerShell 5.1 - use [int16].
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [int16] -or $Value -is [byte] -or
+        $Value -is [uint32] -or $Value -is [uint64] -or
+        $Value -is [double] -or $Value -is [single] -or $Value -is [decimal]) {
+        return [string]::Format([cultureinfo]::InvariantCulture, '{0}', $Value)
+    }
+
+    if ($Value -is [System.Collections.IDictionary]) {
+        $keys = @($Value.Keys)
+        if ($keys.Count -eq 0) { return '{}' }
+        $parts = foreach ($key in $keys) {
+            '{0}{1}: {2}' -f $inner,
+                             (ConvertTo-JsonString -Text ([string] $key)),
+                             (ConvertTo-JsonText -Value $Value[$key] -Level ($Level + 1))
+        }
+        return '{' + $nl + ($parts -join (',' + $nl)) + $nl + $indent + '}'
+    }
+
+    # Checked after [string], which is itself IEnumerable.
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $items = @($Value)
+        if ($items.Count -eq 0) { return '[]' }
+        $parts = foreach ($item in $items) {
+            $inner + (ConvertTo-JsonText -Value $item -Level ($Level + 1))
+        }
+        return '[' + $nl + ($parts -join (',' + $nl)) + $nl + $indent + ']'
+    }
+
+    $props = @($Value.PSObject.Properties)
+    if ($props.Count -eq 0) { return '{}' }
+    $parts = foreach ($prop in $props) {
+        '{0}{1}: {2}' -f $inner,
+                         (ConvertTo-JsonString -Text $prop.Name),
+                         (ConvertTo-JsonText -Value $prop.Value -Level ($Level + 1))
+    }
+    return '{' + $nl + ($parts -join (',' + $nl)) + $nl + $indent + '}'
 }
 
 function Write-JsonFile {
@@ -248,7 +361,11 @@ if (-not (Test-Path -LiteralPath $configDir)) {
 
 # Load existing config, or start a fresh one.
 if (Test-Path -LiteralPath $configFile) {
-    $rawJson = Get-Content -LiteralPath $configFile -Raw
+    # Read via .NET, not Get-Content: Windows PowerShell 5.1 decodes a BOM-less
+    # file using the system ANSI codepage, which corrupts any non-ASCII value in
+    # the config and writes it back double-encoded. ReadAllText assumes UTF-8 and
+    # still honours a BOM if one is present.
+    $rawJson = [System.IO.File]::ReadAllText($configFile)
 
     if ([string]::IsNullOrWhiteSpace($rawJson)) {
         $config = [pscustomobject]@{}
@@ -272,7 +389,7 @@ else {
 }
 
 # Ensure mcpServers exists.
-if ($config.PSObject.Properties.Name -notcontains 'mcpServers' -or $null -eq $config.mcpServers) {
+if (-not (Test-JsonProperty -InputObject $config -Name 'mcpServers') -or $null -eq $config.mcpServers) {
     Set-JsonProperty -InputObject $config -Name 'mcpServers' -Value ([pscustomobject]@{})
 }
 
@@ -282,14 +399,14 @@ $adoServer = [pscustomobject]@{
     args    = @('-y', '@azure-devops/mcp', $Organization)
 }
 
-if ($config.mcpServers.PSObject.Properties.Name -contains $ServerName) {
+if (Test-JsonProperty -InputObject $config.mcpServers -Name $ServerName) {
     Write-Warning "'$ServerName' already exists in mcpServers - it will be overwritten."
 }
 
 if ($PSCmdlet.ShouldProcess($configFile, "Add/update mcpServers.$ServerName")) {
     Set-JsonProperty -InputObject $config.mcpServers -Name $ServerName -Value $adoServer
 
-    $json = $config | ConvertTo-Json -Depth 20
+    $json = ConvertTo-JsonText -Value $config
     Write-JsonFile -Path $configFile -Content $json
 
     Write-Step "Registered MCP server '$ServerName' for organization '$Organization'."

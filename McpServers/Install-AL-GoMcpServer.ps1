@@ -1,0 +1,1 @@
+npm install -g al-go-mcp-server
