@@ -9,10 +9,15 @@
 
     PowerShellVersion = '5.1'
 
-    FunctionsToExport = @('Get-GitHubWorkflowStatus')
+    FunctionsToExport = @('Get-GitHubWorkflowStatus', 'Get-GitHubPullRequest', 'Invoke-GitHubWorkflow')
     CmdletsToExport   = @()
     VariablesToExport = @()
     AliasesToExport   = @()
+
+    FileList = @(
+        'GitHubTools.psd1',
+        'GitHubTools.psm1'
+    )
 
     PrivateData = @{
         PSData = @{
