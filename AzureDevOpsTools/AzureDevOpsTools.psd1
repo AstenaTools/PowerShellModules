@@ -1,6 +1,6 @@
 @{
     RootModule        = 'AzureDevOpsTools.psm1'
-    ModuleVersion     = '0.2.0'
+    ModuleVersion     = '0.3.0'
     GUID              = '71e4805f-29dc-4cc1-b415-9d93968bdaca'
     Author            = 'Soren Klemmensen'
     CompanyName       = 'Astena'
@@ -11,6 +11,7 @@
 
     FunctionsToExport = @(
         'Get-AzureDevOpsPullRequest'
+        'Get-AzureDevOpsPullRequestCount'
         'Get-AzureDevOpsClosedWorkItem'
         'Get-AzureDevOpsClosedWorkItemCount'
     )

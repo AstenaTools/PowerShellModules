@@ -9,7 +9,12 @@ $script:AdoResourceId = '499b84ac-1321-427f-aa17-267ca6975798'
 # The default view: identification, age, and the browser link to open the pull request.
 # Everything else stays on the object for Select-Object/Export-Csv.
 Update-TypeData -TypeName 'AzureDevOps.ActivePullRequest' -Force `
-    -DefaultDisplayPropertySet Id, Project, Repository, Title, CreatedBy, AgeDays, IsDraft, WebUrl
+    -DefaultDisplayPropertySet Id, Project, Repository, Title, CreatedBy, Status, AgeDays, IsDraft, WebUrl
+
+# The default view: the headline count and the status split behind it. The per-project breakdown
+# stays on the object.
+Update-TypeData -TypeName 'AzureDevOps.PullRequestCount' -Force `
+    -DefaultDisplayPropertySet Name, PullRequestCount, Percent, Completed, Abandoned, Active, LastCreated
 
 # The default view: what was closed, by whom and when. AssignedTo and the browser link stay on
 # the object.
@@ -314,10 +319,20 @@ function Get-AdoProjectName {
     } while ($continuation)
 }
 
-function Get-AdoActivePullRequest {
+function Get-AdoPullRequest {
     <#
         .SYNOPSIS
-            Active pull requests of one project, across every repository in it.
+            Pull requests of one project, across every repository in it.
+
+        .DESCRIPTION
+            Private helper. There is no organization-wide pull request route, so a whole
+            organization means one pass per project.
+
+            Status, the creation window and the target branch are all pushed into the search
+            criteria rather than filtered afterwards. That matters: the endpoint truncates a single
+            response at 1000 pull requests, and it ignores a criteria name it does not recognise
+            instead of rejecting it, so every filter used here is one that has been confirmed to
+            take effect.
     #>
     [CmdletBinding()]
     param(
@@ -336,21 +351,43 @@ function Get-AdoActivePullRequest {
         [Parameter(Mandatory)]
         [int]$PageSize,
 
+        [ValidateSet('Active', 'Completed', 'Abandoned', 'All')]
+        [string]$Status = 'Active',
+
+        [Nullable[datetime]]$MinTime,
+
+        [Nullable[datetime]]$MaxTime,
+
         [string]$TargetRefName
     )
+
+    $criteria = 'searchCriteria.status=' + $Status.ToLowerInvariant()
+
+    if ($null -ne $MinTime -or $null -ne $MaxTime) {
+        # Sent explicitly rather than left to its default, so the window is unambiguously about
+        # when the pull request was raised.
+        $criteria += '&searchCriteria.queryTimeRangeType=created'
+
+        if ($null -ne $MinTime) {
+            $criteria += '&searchCriteria.minTime=' + [uri]::EscapeDataString((Format-IsoDateTime ([datetime]$MinTime)))
+        }
+        if ($null -ne $MaxTime) {
+            $criteria += '&searchCriteria.maxTime=' + [uri]::EscapeDataString((Format-IsoDateTime ([datetime]$MaxTime)))
+        }
+    }
+
+    if ($TargetRefName) {
+        $criteria += '&searchCriteria.targetRefName=' + [uri]::EscapeDataString($TargetRefName)
+    }
 
     $found = [System.Collections.Generic.List[object]]::new()
     $skip = 0
 
     do {
-        $uri = 'https://dev.azure.com/{0}/{1}/_apis/git/pullrequests?searchCriteria.status=active&$top={2}&$skip={3}&api-version={4}' -f
+        $uri = 'https://dev.azure.com/{0}/{1}/_apis/git/pullrequests?{2}&$top={3}&$skip={4}&api-version={5}' -f
             [uri]::EscapeDataString($Organization),
             [uri]::EscapeDataString($ProjectName),
-            $PageSize, $skip, $ApiVersion
-
-        if ($TargetRefName) {
-            $uri += '&searchCriteria.targetRefName=' + [uri]::EscapeDataString($TargetRefName)
-        }
+            $criteria, $PageSize, $skip, $ApiVersion
 
         $result = Invoke-AdoApi -Uri $uri -Headers $Headers
         $batch = @(Get-JsonProperty $result.Data 'value')
@@ -418,6 +455,44 @@ function Resolve-TargetRefName {
     return "refs/heads/$Branch"
 }
 
+function Resolve-DateWindow {
+    <#
+        .SYNOPSIS
+            Turns -Days/-Since/-Until into @{ Start = ...; End = ... }, or $null for no window.
+
+        .DESCRIPTION
+            Either bound comes back $null when it is unbounded, so a caller can tell "no window
+            asked for" from "everything up to a date" and leave the filter off the request.
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Nullable[int]]$Days,
+
+        [Nullable[datetime]]$Since,
+
+        [Nullable[datetime]]$Until
+    )
+
+    if ($null -eq $Days -and $null -eq $Since -and $null -eq $Until) { return $null }
+
+    # A [Nullable[T]] parameter holds the unwrapped value, so these are cast rather than read
+    # through .Value - which does not exist on the underlying type and would trip Set-StrictMode.
+    $end = $null
+    if ($null -ne $Until) { $end = [datetime]$Until }
+    elseif ($null -ne $Days) { $end = Get-Date }
+
+    $start = $null
+    if ($null -ne $Since) { $start = [datetime]$Since }
+    elseif ($null -ne $Days -and $null -ne $end) { $start = $end.AddDays( - [int]$Days) }
+
+    if ($null -ne $start -and $null -ne $end -and $start -ge $end) {
+        throw "The requested window is empty: Since '$start' is not before Until '$end'."
+    }
+
+    return @{ Start = $start; End = $end }
+}
+
 function ConvertTo-PullRequestInfo {
     <#
         .SYNOPSIS
@@ -463,6 +538,7 @@ function ConvertTo-PullRequestInfo {
         Repository       = $repoName
         Title            = [string](Get-JsonProperty $PullRequest 'title' '')
         CreatedBy        = [string](Get-JsonProperty $author 'displayName' '')
+        Status           = [string](Get-JsonProperty $PullRequest 'status' '')
         AgeDays          = $ageDays
         IsDraft          = [bool](Get-JsonProperty $PullRequest 'isDraft' $false)
         SourceBranch     = Get-ShortBranchName ([string](Get-JsonProperty $PullRequest 'sourceRefName' ''))
@@ -473,6 +549,7 @@ function ConvertTo-PullRequestInfo {
         ReviewerCount    = $reviewers.Count
         MergeStatus      = [string](Get-JsonProperty $PullRequest 'mergeStatus' '')
         CreationDate     = $created
+        ClosedDate       = ConvertTo-DateTimeValue (Get-JsonProperty $PullRequest 'closedDate')
         CreatedByEmail   = [string](Get-JsonProperty $author 'uniqueName' '')
         WebUrl           = $webUrl
     }
@@ -484,13 +561,21 @@ function ConvertTo-PullRequestInfo {
 function Get-AzureDevOpsPullRequest {
     <#
         .SYNOPSIS
-            Retrieves every active pull request across all projects in an Azure DevOps organization.
+            Retrieves pull requests across all projects in an Azure DevOps organization.
 
         .DESCRIPTION
             Enumerates the projects of the organization, then queries each project's Git pull
-            requests with status "active" and emits one object per pull request. Because the query is
-            project-scoped rather than repository-scoped, a whole organization is covered in a
-            handful of REST calls.
+            requests and emits one object per pull request. Because the query is project-scoped
+            rather than repository-scoped, a whole organization is covered in one call per project
+            plus paging.
+
+            Only active pull requests are returned unless -Status says otherwise, and every pull
+            request regardless of age unless -Days, -Since or -Until narrow it to a creation window.
+            Both filters are applied by the server rather than afterwards, which matters because a
+            single response is truncated at 1000 pull requests.
+
+            Use Get-AzureDevOpsPullRequestCount for per-person or per-project totals over the same
+            set.
 
             Authentication is resolved in this order:
               1. -PersonalAccessToken
@@ -500,8 +585,9 @@ function Get-AzureDevOpsPullRequest {
               5. az account get-access-token    (an existing 'az login' session)
 
             Results are objects, so they can be piped to Format-Table, Export-Csv, Where-Object and
-            friends. The default view shows Id, Project, Repository, Title, CreatedBy, AgeDays,
-            IsDraft and WebUrl; the remaining properties stay on the object for Select-Object.
+            friends. The default view shows Id, Project, Repository, Title, CreatedBy, Status,
+            AgeDays, IsDraft and WebUrl; the remaining properties stay on the object for
+            Select-Object.
 
             Oldest first: age is what makes a stale pull request worth looking at. Drafts are
             included unless -ExcludeDrafts is used.
@@ -516,6 +602,18 @@ function Get-AzureDevOpsPullRequest {
 
         .PARAMETER Project
             Limit the scan to these projects (name or id). Omit to scan all of them.
+
+        .PARAMETER Status
+            Which pull requests to return: Active, Completed, Abandoned or All. Default: Active.
+
+        .PARAMETER Days
+            Only return pull requests created in the last this many days. Omit for no age limit.
+
+        .PARAMETER Since
+            Only return pull requests created at or after this time. Overrides -Days.
+
+        .PARAMETER Until
+            Only return pull requests created before this time.
 
         .PARAMETER CreatedBy
             Only return pull requests whose author display name or sign-in name contains this text.
@@ -552,6 +650,9 @@ function Get-AzureDevOpsPullRequest {
             All active pull requests in the astena organization, oldest first.
 
         .EXAMPLE
+            Get-AzureDevOpsPullRequest -Status Completed -Since '2026-01-01'
+
+        .EXAMPLE
             Get-AzureDevOpsPullRequest -Format Table
 
         .EXAMPLE
@@ -561,12 +662,18 @@ function Get-AzureDevOpsPullRequest {
             Get-AzureDevOpsPullRequest -CreatedBy 'Klemmensen' | Select-Object Title, AgeDays, WebUrl
 
         .EXAMPLE
+            Get-AzureDevOpsPullRequest -Status All -Days 30
+
+            Every pull request raised in the last 30 days, whatever became of it.
+
+        .EXAMPLE
             Get-AzureDevOpsPullRequest | Export-Csv .\active-prs.csv -NoTypeInformation
 
         .OUTPUTS
             AzureDevOps.ActivePullRequest objects carrying Id, Project, Repository, Title, CreatedBy,
-            AgeDays, IsDraft, SourceBranch, TargetBranch, Approvals, WaitingForAuthor, Rejections,
-            ReviewerCount, MergeStatus, CreationDate, CreatedByEmail and WebUrl.
+            Status, AgeDays, IsDraft, SourceBranch, TargetBranch, Approvals, WaitingForAuthor,
+            Rejections, ReviewerCount, MergeStatus, CreationDate, ClosedDate, CreatedByEmail and
+            WebUrl.
             With -Format Table or -Format List, formatting objects for display instead.
 
         .NOTES
@@ -580,6 +687,16 @@ function Get-AzureDevOpsPullRequest {
         [string]$Organization = 'astena',
 
         [string[]]$Project,
+
+        [ValidateSet('Active', 'Completed', 'Abandoned', 'All')]
+        [string]$Status = 'Active',
+
+        [ValidateRange(1, 3650)]
+        [Nullable[int]]$Days,
+
+        [Nullable[datetime]]$Since,
+
+        [Nullable[datetime]]$Until,
 
         [string]$CreatedBy,
 
@@ -614,6 +731,22 @@ function Get-AzureDevOpsPullRequest {
 
         $targetRef = Resolve-TargetRefName $TargetBranch
 
+        $window = Resolve-DateWindow -Days $Days -Since $Since -Until $Until
+        $minTime = $null
+        $maxTime = $null
+        if ($null -ne $window) {
+            $minTime = $window.Start
+
+            # The endpoint treats maxTime as inclusive. Stepping back a second keeps the window
+            # half-open like the other cmdlets, so two consecutive ranges cannot both claim a
+            # pull request raised exactly on the boundary.
+            if ($null -ne $window.End) { $maxTime = ([datetime]$window.End).AddSeconds(-1) }
+
+            Write-Verbose ("Created between {0} and {1}." -f
+                $(if ($null -ne $minTime) { ([datetime]$minTime).ToString('u') } else { 'the beginning' }),
+                $(if ($null -ne $maxTime) { ([datetime]$maxTime).ToString('u') } else { 'now' }))
+        }
+
         if ($Project) {
             $projectNames = @($Project)
             Write-Verbose "Scanning $($projectNames.Count) requested project(s)."
@@ -629,13 +762,13 @@ function Get-AzureDevOpsPullRequest {
 
         foreach ($projectName in $projectNames) {
             $index++
-            Write-Progress -Activity 'Collecting active pull requests' -Status $projectName `
+            Write-Progress -Activity 'Collecting pull requests' -Status $projectName `
                 -PercentComplete (100 * $index / [math]::Max($projectNames.Count, 1))
 
             try {
-                $raw = @(Get-AdoActivePullRequest -Headers $restHeaders -Organization $Organization `
+                $raw = @(Get-AdoPullRequest -Headers $restHeaders -Organization $Organization `
                         -ProjectName $projectName -ApiVersion $ApiVersion -PageSize $PageSize `
-                        -TargetRefName $targetRef)
+                        -Status $Status -MinTime $minTime -MaxTime $maxTime -TargetRefName $targetRef)
             }
             catch {
                 # A project without the Git service, or one the credential cannot read, must not
@@ -647,10 +780,10 @@ function Get-AzureDevOpsPullRequest {
             foreach ($pr in $raw) {
                 $pullRequests.Add((ConvertTo-PullRequestInfo -PullRequest $pr -Organization $Organization -Now $now))
             }
-            Write-Verbose "$projectName -> $($raw.Count) active pull request(s)."
+            if ($raw.Count) { Write-Verbose "$projectName -> $($raw.Count) pull request(s)." }
         }
 
-        Write-Progress -Activity 'Collecting active pull requests' -Completed
+        Write-Progress -Activity 'Collecting pull requests' -Completed
 
         $results = $pullRequests
 
@@ -667,7 +800,7 @@ function Get-AzureDevOpsPullRequest {
         $results = @($results | Sort-Object -Property @{ Expression = 'AgeDays'; Descending = $true })
 
         $draftCount = @($results | Where-Object { $_.IsDraft }).Count
-        Write-Verbose "$($results.Count) active pull request(s), $draftCount of them draft."
+        Write-Verbose "$($results.Count) pull request(s) with status '$Status', $draftCount of them draft."
 
         switch ($Format) {
             'Table' { $results | Format-Table -AutoSize }
@@ -677,10 +810,10 @@ function Get-AzureDevOpsPullRequest {
     }
 }
 
-function Format-WiqlDate {
+function Format-IsoDateTime {
     <#
         .SYNOPSIS
-            Renders a date as the UTC ISO 8601 literal a WIQL comparison expects.
+            Renders a date as the UTC ISO 8601 literal the REST API and WIQL both expect.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -770,8 +903,8 @@ function Get-AdoClosedWorkItemId {
         [uri]::EscapeDataString($Organization), $ApiVersion
 
     $conditions = [System.Collections.Generic.List[string]]::new()
-    $conditions.Add("[Microsoft.VSTS.Common.ClosedDate] >= '$(Format-WiqlDate $Since)'")
-    $conditions.Add("[Microsoft.VSTS.Common.ClosedDate] < '$(Format-WiqlDate $Until)'")
+    $conditions.Add("[Microsoft.VSTS.Common.ClosedDate] >= '$(Format-IsoDateTime $Since)'")
+    $conditions.Add("[Microsoft.VSTS.Common.ClosedDate] < '$(Format-IsoDateTime $Until)'")
     if ($Project) {
         $names = @($Project | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ', '
         $conditions.Add("[System.TeamProject] IN ($names)")
@@ -1048,14 +1181,10 @@ function Get-AzureDevOpsClosedWorkItem {
     }
 
     process {
-        # A [Nullable[datetime]] parameter holds an unwrapped DateTime, so it is cast rather than
-        # unwrapped with .Value - which does not exist on DateTime and would trip Set-StrictMode.
-        $rangeEnd = if ($null -ne $Until) { [datetime]$Until } else { Get-Date }
-        $rangeStart = if ($null -ne $Since) { [datetime]$Since } else { $rangeEnd.AddDays(-$Days) }
-
-        if ($rangeStart -ge $rangeEnd) {
-            throw "The requested window is empty: Since '$rangeStart' is not before Until '$rangeEnd'."
-        }
+        # -Days always has a value here, so both bounds always come back set.
+        $window = Resolve-DateWindow -Days $Days -Since $Since -Until $Until
+        $rangeStart = [datetime]$window.Start
+        $rangeEnd = [datetime]$window.End
 
         $auth = Resolve-AuthorizationHeader -PersonalAccessToken $PersonalAccessToken
         $restHeaders = @{
@@ -1305,8 +1434,257 @@ function Get-AzureDevOpsClosedWorkItemCount {
     }
 }
 
+function Get-AzureDevOpsPullRequestCount {
+    <#
+        .SYNOPSIS
+            Counts the pull requests created in a period across an Azure DevOps organization.
+
+        .DESCRIPTION
+            Collects the pull requests raised in the requested window with
+            Get-AzureDevOpsPullRequest, then aggregates them and emits one row per group, busiest
+            first. The default is every project in the organization, the last 365 days, every
+            status, grouped by the person who opened the pull request.
+
+            Counting is by creation date, so a pull request raised in the window counts whatever
+            became of it afterwards - the Completed, Abandoned and Active columns break that down,
+            and drafts are included unless -ExcludeDrafts is used.
+
+            When grouping by person, people are matched on sign-in name where Azure DevOps supplies
+            one and on display name otherwise, so a display name change does not split someone
+            across two rows. Pull requests raised by a build identity or a service principal are
+            counted like any other author.
+
+            There is no organization-wide pull request route, so a full scan is one pass per
+            project - noticeably slower than the work item report, and the reason -Project is worth
+            using when a single team is all that matters.
+
+            Authentication is resolved in this order:
+              1. -PersonalAccessToken
+              2. $env:AZURE_DEVOPS_EXT_PAT      (the Azure CLI devops extension PAT)
+              3. $env:AZURE_DEVOPS_PAT
+              4. $env:SYSTEM_ACCESSTOKEN        (OAuth token inside a pipeline)
+              5. az account get-access-token    (an existing 'az login' session)
+
+        .PARAMETER Organization
+            Azure DevOps organization name. Default: astena
+
+        .PARAMETER Project
+            Limit the scan to these projects (name or id). Omit to scan all of them.
+
+        .PARAMETER GroupBy
+            What each row counts.
+
+            CreatedBy   One row per person who opened pull requests (default).
+            Project     One row per project.
+            Repository  One row per repository, named 'Project/Repository'.
+
+        .PARAMETER Status
+            Which pull requests to count: Active, Completed, Abandoned or All. Default: All, because
+            a pull request that has since been merged or abandoned was still created in the window.
+
+        .PARAMETER Days
+            Size of the window ending now, in days. Default: 365, the last year. Ignored when
+            -Since is used.
+
+        .PARAMETER Since
+            Start of the window, inclusive. Overrides -Days.
+
+        .PARAMETER Until
+            End of the window, exclusive. Default: now.
+
+        .PARAMETER CreatedBy
+            Only count pull requests whose author's display name or sign-in name contains this text.
+
+        .PARAMETER TargetBranch
+            Only count pull requests targeting this branch, e.g. main or refs/heads/release/1.0.
+
+        .PARAMETER ExcludeDrafts
+            Leave draft pull requests out of the count.
+
+        .PARAMETER PersonalAccessToken
+            Azure DevOps PAT with the Code (read) scope. Overrides every other credential source.
+
+        .PARAMETER ApiVersion
+            REST API version. Default: 7.1
+
+        .PARAMETER PageSize
+            Pull requests fetched per request, 1-1000. Default: 1000, the server's own ceiling,
+            which keeps a full-organization scan to as few calls as possible.
+
+        .PARAMETER Format
+            How to render the result.
+
+            Object  Emit one object per group (default). Fully pipeable.
+            Table   Render as a table, equivalent to piping to Format-Table -AutoSize.
+            List    Render as a list, one property per line, showing every property.
+
+            Table and List produce display output rather than data: the result cannot be piped into
+            Where-Object, Sort-Object or Export-Csv afterwards.
+
+        .EXAMPLE
+            Get-AzureDevOpsPullRequestCount
+
+            Pull requests created per person over the last year, across every project.
+
+        .EXAMPLE
+            Get-AzureDevOpsPullRequestCount -Format Table
+
+        .EXAMPLE
+            Get-AzureDevOpsPullRequestCount -GroupBy Project
+
+            The same year, counted per project instead of per person.
+
+        .EXAMPLE
+            Get-AzureDevOpsPullRequestCount -Days 90 -GroupBy Repository |
+                Select-Object -First 10
+
+            The ten busiest repositories of the last quarter.
+
+        .EXAMPLE
+            Get-AzureDevOpsPullRequestCount -Since '2025-01-01' -Until '2026-01-01' |
+                Export-Csv .\pull-requests-2025.csv -NoTypeInformation
+
+            A calendar-year report, written to CSV.
+
+        .EXAMPLE
+            Get-AzureDevOpsPullRequestCount -Project 'DevGIT.AL' -Status Completed
+
+            Only the pull requests of one project that were merged.
+
+        .OUTPUTS
+            AzureDevOps.PullRequestCount objects carrying Name, GroupBy, PullRequestCount, Percent,
+            Completed, Abandoned, Active, Draft, ProjectCount, Projects, FirstCreated and
+            LastCreated.
+            With -Format Table or -Format List, formatting objects for display instead.
+
+        .NOTES
+            Compatible with Windows PowerShell 5.1 and PowerShell 7+.
+            A PAT needs only the "Code (read)" scope.
+
+            Use Get-AzureDevOpsPullRequest for the pull requests themselves; this cmdlet is the
+            aggregate over exactly the same set.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [ValidateNotNullOrEmpty()]
+        [string]$Organization = 'astena',
+
+        [string[]]$Project,
+
+        [ValidateSet('CreatedBy', 'Project', 'Repository')]
+        [string]$GroupBy = 'CreatedBy',
+
+        [ValidateSet('Active', 'Completed', 'Abandoned', 'All')]
+        [string]$Status = 'All',
+
+        [ValidateRange(1, 3650)]
+        [int]$Days = 365,
+
+        [Nullable[datetime]]$Since,
+
+        [Nullable[datetime]]$Until,
+
+        [string]$CreatedBy,
+
+        [string]$TargetBranch,
+
+        [switch]$ExcludeDrafts,
+
+        [string]$PersonalAccessToken,
+
+        [ValidateNotNullOrEmpty()]
+        [string]$ApiVersion = '7.1',
+
+        [ValidateRange(1, 1000)]
+        [int]$PageSize = 1000,
+
+        [ValidateSet('Object', 'Table', 'List')]
+        [string]$Format = 'Object'
+    )
+
+    process {
+        $pullRequests = @(Get-AzureDevOpsPullRequest -Organization $Organization -Project $Project `
+                -Status $Status -Days $Days -Since $Since -Until $Until `
+                -CreatedBy $CreatedBy -TargetBranch $TargetBranch -ExcludeDrafts:$ExcludeDrafts `
+                -PersonalAccessToken $PersonalAccessToken -ApiVersion $ApiVersion -PageSize $PageSize)
+
+        $total = $pullRequests.Count
+        if ($total -eq 0) {
+            Write-Verbose 'No pull requests were created in the requested window.'
+            return
+        }
+
+        # $GroupBy is read through a copy of the pipeline object: switch rebinds $_ to the value it
+        # is testing, which would otherwise leave these branches reading properties of $GroupBy.
+        $groups = $pullRequests | Group-Object -Property {
+            $pr = $_
+            switch ($GroupBy) {
+                'Project' { $pr.Project }
+                'Repository' { '{0}/{1}' -f $pr.Project, $pr.Repository }
+                default {
+                    if ($pr.CreatedByEmail) { $pr.CreatedByEmail.ToLowerInvariant() }
+                    elseif ($pr.CreatedBy) { $pr.CreatedBy.ToLowerInvariant() }
+                    else { '' }
+                }
+            }
+        }
+
+        $summaries = [System.Collections.Generic.List[object]]::new()
+
+        foreach ($group in $groups) {
+            $members = @($group.Group)
+            $first = $members[0]
+
+            $name = switch ($GroupBy) {
+                'Project' { $first.Project }
+                'Repository' { '{0}/{1}' -f $first.Project, $first.Repository }
+                default {
+                    $names = @($members | ForEach-Object { $_.CreatedBy } | Where-Object { $_ })
+                    if ($names.Count) { [string]$names[0] } else { '(unknown)' }
+                }
+            }
+
+            $emails = @($members | ForEach-Object { $_.CreatedByEmail } | Where-Object { $_ })
+            $dates = @($members | ForEach-Object { $_.CreationDate } | Where-Object { $null -ne $_ } | Sort-Object)
+            $projects = @($members | ForEach-Object { $_.Project } | Where-Object { $_ } | Sort-Object -Unique)
+
+            $summary = [pscustomobject]@{
+                Name             = $name
+                GroupBy          = $GroupBy
+                PullRequestCount = $members.Count
+                Percent          = [math]::Round(100 * $members.Count / $total, 1)
+                Completed        = @($members | Where-Object { $_.Status -eq 'completed' }).Count
+                Abandoned        = @($members | Where-Object { $_.Status -eq 'abandoned' }).Count
+                Active           = @($members | Where-Object { $_.Status -eq 'active' }).Count
+                Draft            = @($members | Where-Object { $_.IsDraft }).Count
+                CreatedByEmail   = if ($emails.Count) { [string]$emails[0] } else { '' }
+                ProjectCount     = $projects.Count
+                Projects         = ($projects -join ', ')
+                FirstCreated     = if ($dates.Count) { $dates[0] } else { $null }
+                LastCreated      = if ($dates.Count) { $dates[$dates.Count - 1] } else { $null }
+            }
+
+            $summary.PSObject.TypeNames.Insert(0, 'AzureDevOps.PullRequestCount')
+            $summaries.Add($summary)
+        }
+
+        # Busiest first, then by name so equal counts come out in a stable order.
+        $results = @($summaries | Sort-Object -Property @{ Expression = 'PullRequestCount'; Descending = $true }, 'Name')
+
+        Write-Verbose "$total pull request(s) across $($results.Count) $GroupBy group(s)."
+
+        switch ($Format) {
+            'Table' { $results | Format-Table -AutoSize }
+            'List' { $results | Format-List }
+            default { $results }
+        }
+    }
+}
+
 Export-ModuleMember -Function @(
     'Get-AzureDevOpsPullRequest'
+    'Get-AzureDevOpsPullRequestCount'
     'Get-AzureDevOpsClosedWorkItem'
     'Get-AzureDevOpsClosedWorkItemCount'
 )
