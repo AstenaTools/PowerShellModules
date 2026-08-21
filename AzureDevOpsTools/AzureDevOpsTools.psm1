@@ -6,6 +6,22 @@ Set-StrictMode -Version Latest
 # access token.
 $script:AdoResourceId = '499b84ac-1321-427f-aa17-267ca6975798'
 
+# Table views for the types below. Without them PowerShell renders each as a property-per-line
+# list, because it only auto-tables a display set of four properties or fewer - which buried the
+# very number the count cmdlets exist to report.
+#
+# Loaded here rather than through the manifest's FormatsToProcess: that aborts the import outright
+# if the file is missing, so a copy of the module that arrived without it - an older installer, a
+# hand-copied folder - would not load at all. This way the cmdlets keep working and only fall back
+# to the list rendering.
+$script:FormatFile = Join-Path $PSScriptRoot 'AzureDevOpsTools.format.ps1xml'
+if (Test-Path -Path $script:FormatFile) {
+    Update-FormatData -PrependPath $script:FormatFile
+}
+else {
+    Write-Verbose "No format file at '$script:FormatFile'; output will render as lists rather than tables."
+}
+
 # The default view: identification, age, and the browser link to open the pull request.
 # Everything else stays on the object for Select-Object/Export-Csv.
 Update-TypeData -TypeName 'AzureDevOps.ActivePullRequest' -Force `

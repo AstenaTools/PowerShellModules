@@ -1,6 +1,6 @@
 @{
     RootModule        = 'AzureDevOpsTools.psm1'
-    ModuleVersion     = '0.3.0'
+    ModuleVersion     = '0.4.0'
     GUID              = '71e4805f-29dc-4cc1-b415-9d93968bdaca'
     Author            = 'Soren Klemmensen'
     CompanyName       = 'Astena'
@@ -19,9 +19,11 @@
     VariablesToExport = @()
     AliasesToExport   = @()
 
+    # The installer downloads exactly what this lists, so a new file must be added here.
     FileList = @(
         'AzureDevOpsTools.psd1',
-        'AzureDevOpsTools.psm1'
+        'AzureDevOpsTools.psm1',
+        'AzureDevOpsTools.format.ps1xml'
     )
 
     PrivateData = @{
