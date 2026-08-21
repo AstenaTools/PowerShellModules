@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
     .SYNOPSIS
-        Downloads the GitHubTools module from the OxygenTools/GitHubPowerShellModules repository and imports it.
+        Downloads the GitHubTools module from the AstenaTools/PowerShellModules repository and imports it.
 
     .DESCRIPTION
         Fetches the module files straight from GitHub — no git clone and no PowerShell Gallery needed — and
@@ -39,13 +39,13 @@
         Load a pinned version for this session only, installing nothing.
 
     .EXAMPLE
-        $s = 'https://raw.githubusercontent.com/OxygenTools/GitHubPowerShellModules/main/Install-GitHubTools.ps1'
+        $s = 'https://raw.githubusercontent.com/AstenaTools/PowerShellModules/main/Install-GitHubTools.ps1'
         Invoke-Expression (Invoke-RestMethod $s)
 
         One-liner bootstrap on a machine that does not have the repository cloned. Uses all defaults.
 
     .LINK
-        https://github.com/OxygenTools/GitHubPowerShellModules
+        https://github.com/AstenaTools/PowerShellModules
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
@@ -64,8 +64,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$Owner      = 'OxygenTools'
-$Repository = 'GitHubPowerShellModules'
+$Owner      = 'AstenaTools'
+$Repository = 'PowerShellModules'
 $ModuleName = 'GitHubTools'
 $ModuleFiles = @("$ModuleName.psd1", "$ModuleName.psm1")
 

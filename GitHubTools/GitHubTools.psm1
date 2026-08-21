@@ -129,24 +129,24 @@ function Get-GitHubWorkflowStatus {
             Include archived repositories, which are excluded by default.
 
         .EXAMPLE
-            Get-GitHubWorkflowStatus -wf 'ci.yml' -org 'OxygenTools' -Format Table
+            Get-GitHubWorkflowStatus -wf 'ci.yml' -org 'AstenaTools' -Format Table
 
             Print a compact table of every repository and the outcome of its latest 'ci.yml' run.
 
         .EXAMPLE
-            Get-GitHubWorkflowStatus -wf 'ci.yml' -org 'OxygenTools' -Format List
+            Get-GitHubWorkflowStatus -wf 'ci.yml' -org 'AstenaTools' -Format List
 
             Print the same information vertically, one property per line.
 
         .EXAMPLE
-            Get-GitHubWorkflowStatus -wf 'Generic_Build.yml' -org 'OxygenTools' |
+            Get-GitHubWorkflowStatus -wf 'Generic_Build.yml' -org 'AstenaTools' |
                 Where-Object Status -eq 'failure' |
                 Sort-Object When -Descending
 
             Omit -Format to keep the objects pipeable, and report only the failing builds.
 
         .EXAMPLE
-            Get-GitHubWorkflowStatus -wf 'ci.yml' -org 'OxygenTools' |
+            Get-GitHubWorkflowStatus -wf 'ci.yml' -org 'AstenaTools' |
                 Export-Csv .\workflow-status.csv -NoTypeInformation
 
         .OUTPUTS
@@ -304,26 +304,26 @@ function Get-GitHubPullRequest {
             keep processing the result.
 
         .EXAMPLE
-            Get-GitHubPullRequest -org 'OxygenTools' -Format Table
+            Get-GitHubPullRequest -org 'AstenaTools' -Format Table
 
             Every open pull request in the organization, as a table.
 
         .EXAMPLE
-            Get-GitHubPullRequest -org 'OxygenTools' -ExcludeDrafts |
+            Get-GitHubPullRequest -org 'AstenaTools' -ExcludeDrafts |
                 Where-Object AgeDays -gt 14 |
                 Sort-Object AgeDays -Descending
 
             Ready-for-review pull requests that have been open longer than two weeks.
 
         .EXAMPLE
-            Get-GitHubPullRequest -org 'OxygenTools' -State Merged -Limit 500 |
+            Get-GitHubPullRequest -org 'AstenaTools' -State Merged -Limit 500 |
                 Group-Object Author |
                 Sort-Object Count -Descending
 
             Who merged the most pull requests.
 
         .EXAMPLE
-            Get-GitHubPullRequest -org 'OxygenTools' |
+            Get-GitHubPullRequest -org 'AstenaTools' |
                 Export-Csv .\open-prs.csv -NoTypeInformation
 
         .OUTPUTS
@@ -563,23 +563,23 @@ function Invoke-GitHubWorkflow {
             Where-Object, Sort-Object or Export-Csv afterwards.
 
         .EXAMPLE
-            Invoke-GitHubWorkflow -wf 'ci.yml' -org 'OxygenTools' -WhatIf
+            Invoke-GitHubWorkflow -wf 'ci.yml' -org 'AstenaTools' -WhatIf
 
             Show which repositories would have 'ci.yml' dispatched, without starting anything.
             Always worth running first.
 
         .EXAMPLE
-            Invoke-GitHubWorkflow -wf 'ci.yml' -org 'OxygenTools' -Format Table
+            Invoke-GitHubWorkflow -wf 'ci.yml' -org 'AstenaTools' -Format Table
 
             Dispatch after confirming, and print the outcome per repository.
 
         .EXAMPLE
-            Invoke-GitHubWorkflow -wf 'ci.yml' -org 'OxygenTools' -Repository 'OxygenTools/AppA' -Force
+            Invoke-GitHubWorkflow -wf 'ci.yml' -org 'AstenaTools' -Repository 'AstenaTools/AppA' -Force
 
             Trial run against a single repository with no prompt.
 
         .EXAMPLE
-            Invoke-GitHubWorkflow -wf 'ci.yml' -org 'OxygenTools' -Force |
+            Invoke-GitHubWorkflow -wf 'ci.yml' -org 'AstenaTools' -Force |
                 Where-Object Action -eq 'Failed'
 
             Dispatch everywhere and report only the repositories that refused.
