@@ -6,6 +6,11 @@ Set-StrictMode -Version Latest
 # access token.
 $script:AdoResourceId = '499b84ac-1321-427f-aa17-267ca6975798'
 
+# A WIQL comparison needs a concrete lower bound, and the window-splitting recursion needs one to
+# halve, so an unbounded work item search starts here instead - comfortably older than any work
+# item Azure DevOps or a TFS migration can hold.
+$script:WorkItemEpoch = [datetime]::SpecifyKind([datetime]'1990-01-01', 'Utc')
+
 # Table views for the types below. Without them PowerShell renders each as a property-per-line
 # list, because it only auto-tables a display set of four properties or fewer - which buried the
 # very number the count cmdlets exist to report.
@@ -471,14 +476,17 @@ function Resolve-TargetRefName {
     return "refs/heads/$Branch"
 }
 
-function Resolve-DateWindow {
+function Resolve-DateWindowArgument {
     <#
         .SYNOPSIS
-            Turns -Days/-Since/-Until into @{ Start = ...; End = ... }, or $null for no window.
+            Builds the -Days/-Since/-Until/-AllTime arguments a count cmdlet forwards to its
+            retrieval cmdlet, as a hashtable to splat.
 
         .DESCRIPTION
-            Either bound comes back $null when it is unbounded, so a caller can tell "no window
-            asked for" from "everything up to a date" and leave the filter off the request.
+            Private helper. The counts report on a year by default, but Get-AzureDevOpsPullRequest
+            has no age limit of its own, so the default cannot be left to the callee - it is made
+            explicit here. Only what the caller actually asked for is forwarded otherwise, so
+            naming one bound does not drag a default-sized window along with it.
     #>
     [CmdletBinding()]
     [OutputType([hashtable])]
@@ -487,8 +495,69 @@ function Resolve-DateWindow {
 
         [Nullable[datetime]]$Since,
 
-        [Nullable[datetime]]$Until
+        [Nullable[datetime]]$Until,
+
+        [switch]$AllTime,
+
+        [int]$DefaultDays = 365
     )
+
+    if ($AllTime) {
+        if ($null -ne $Days -or $null -ne $Since -or $null -ne $Until) {
+            throw '-AllTime cannot be combined with -Days, -Since or -Until: it already means every date.'
+        }
+        return @{ AllTime = $true }
+    }
+
+    if ($null -eq $Days -and $null -eq $Since -and $null -eq $Until) {
+        return @{ Days = $DefaultDays }
+    }
+
+    $arguments = @{}
+    if ($null -ne $Days) { $arguments['Days'] = [int]$Days }
+    if ($null -ne $Since) { $arguments['Since'] = [datetime]$Since }
+    if ($null -ne $Until) { $arguments['Until'] = [datetime]$Until }
+    return $arguments
+}
+
+function Resolve-DateWindow {
+    <#
+        .SYNOPSIS
+            Turns -Days/-Since/-Until/-AllTime into @{ Start = ...; End = ... }, or $null for no window.
+
+        .DESCRIPTION
+            Either bound comes back $null when it is unbounded, so a caller can tell "no window
+            asked for" from "everything up to a date" and leave the filter off the request.
+
+            DefaultDays is applied only when the caller named no date at all. Naming either bound is
+            taken at face value, so -Until on its own means everything up to then rather than a
+            default-sized window ending there - which would silently reach back past the default
+            window and make two half-ranges sum to more than the whole.
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Nullable[int]]$Days,
+
+        [Nullable[datetime]]$Since,
+
+        [Nullable[datetime]]$Until,
+
+        [switch]$AllTime,
+
+        [Nullable[int]]$DefaultDays
+    )
+
+    if ($AllTime) {
+        if ($null -ne $Days -or $null -ne $Since -or $null -ne $Until) {
+            throw '-AllTime cannot be combined with -Days, -Since or -Until: it already means every date.'
+        }
+        return @{ Start = $null; End = $null }
+    }
+
+    if ($null -eq $Days -and $null -eq $Since -and $null -eq $Until -and $null -ne $DefaultDays) {
+        $Days = $DefaultDays
+    }
 
     if ($null -eq $Days -and $null -eq $Since -and $null -eq $Until) { return $null }
 
@@ -626,10 +695,15 @@ function Get-AzureDevOpsPullRequest {
             Only return pull requests created in the last this many days. Omit for no age limit.
 
         .PARAMETER Since
-            Only return pull requests created at or after this time. Overrides -Days.
+            Only return pull requests created at or after this time.
 
         .PARAMETER Until
-            Only return pull requests created before this time.
+            Only return pull requests created before this time. On its own it leaves the start
+            unbounded, so -Until X and -Since X tile exactly.
+
+        .PARAMETER AllTime
+            Place no limit on the creation date - the default anyway for this cmdlet, and accepted
+            so that a script can say so explicitly. Cannot be combined with -Days, -Since or -Until.
 
         .PARAMETER CreatedBy
             Only return pull requests whose author display name or sign-in name contains this text.
@@ -714,6 +788,8 @@ function Get-AzureDevOpsPullRequest {
 
         [Nullable[datetime]]$Until,
 
+        [switch]$AllTime,
+
         [string]$CreatedBy,
 
         [string]$TargetBranch,
@@ -747,7 +823,7 @@ function Get-AzureDevOpsPullRequest {
 
         $targetRef = Resolve-TargetRefName $TargetBranch
 
-        $window = Resolve-DateWindow -Days $Days -Since $Since -Until $Until
+        $window = Resolve-DateWindow -Days $Days -Since $Since -Until $Until -AllTime:$AllTime
         $minTime = $null
         $maxTime = $null
         if ($null -ne $window) {
@@ -1102,13 +1178,19 @@ function Get-AzureDevOpsClosedWorkItem {
             query rather than afterwards, so naming a project also makes the scan cheaper.
 
         .PARAMETER Days
-            Size of the window ending now, in days. Default: 365. Ignored when -Since is used.
+            Size of the window ending now, in days. Default: 365 - applied only when no date is
+            named at all.
 
         .PARAMETER Since
-            Start of the window, inclusive. Overrides -Days.
+            Start of the window, inclusive. The window then ends now unless -Until says otherwise.
 
         .PARAMETER Until
-            End of the window, exclusive. Default: now.
+            End of the window, exclusive. On its own it means everything up to then - it does not
+            drag the default window along with it, so -Until X and -Since X tile exactly, with no
+            overlap and no gap between them.
+
+        .PARAMETER AllTime
+            Return items closed at any date. Cannot be combined with -Days, -Since or -Until.
 
         .PARAMETER WorkItemType
             Only return these work item types, e.g. Bug, Task, 'User Story'.
@@ -1170,11 +1252,13 @@ function Get-AzureDevOpsClosedWorkItem {
         [string[]]$Project,
 
         [ValidateRange(1, 3650)]
-        [int]$Days = 365,
+        [Nullable[int]]$Days,
 
         [Nullable[datetime]]$Since,
 
         [Nullable[datetime]]$Until,
+
+        [switch]$AllTime,
 
         [string[]]$WorkItemType,
 
@@ -1197,10 +1281,15 @@ function Get-AzureDevOpsClosedWorkItem {
     }
 
     process {
-        # -Days always has a value here, so both bounds always come back set.
-        $window = Resolve-DateWindow -Days $Days -Since $Since -Until $Until
-        $rangeStart = [datetime]$window.Start
-        $rangeEnd = [datetime]$window.End
+        # A year unless told otherwise, and concrete bounds either way: WIQL has to compare
+        # ClosedDate against something, and the overflow split needs a range it can halve.
+        $window = Resolve-DateWindow -Days $Days -Since $Since -Until $Until -AllTime:$AllTime -DefaultDays 365
+        $rangeStart = if ($null -ne $window.Start) { [datetime]$window.Start } else { $script:WorkItemEpoch }
+        $rangeEnd = if ($null -ne $window.End) { [datetime]$window.End } else { Get-Date }
+
+        if ($rangeStart -ge $rangeEnd) {
+            throw "The requested window is empty: Since '$rangeStart' is not before Until '$rangeEnd'."
+        }
 
         $auth = Resolve-AuthorizationHeader -PersonalAccessToken $PersonalAccessToken
         $restHeaders = @{
@@ -1275,6 +1364,11 @@ function Get-AzureDevOpsClosedWorkItemCount {
             with no ClosedBy value at all are grouped under '(unknown)' rather than dropped, so the
             counts still add up to the total.
 
+            The default window is the last year, not all of history: use -AllTime for that. Naming
+            one bound does not bring the default along with it, so splitting a range at a single
+            date - -Until '2026-01-01' for one half and -Since '2026-01-01' for the other - gives
+            two counts that sum to the whole.
+
             Authentication is resolved in this order:
               1. -PersonalAccessToken
               2. $env:AZURE_DEVOPS_EXT_PAT      (the Azure CLI devops extension PAT)
@@ -1290,14 +1384,20 @@ function Get-AzureDevOpsClosedWorkItemCount {
             query rather than afterwards, so naming a project also makes the scan cheaper.
 
         .PARAMETER Days
-            Size of the window ending now, in days. Default: 365, the last year. Ignored when
-            -Since is used.
+            Size of the window ending now, in days. Default: 365, the last year - applied only when
+            no date is named at all.
 
         .PARAMETER Since
-            Start of the window, inclusive. Overrides -Days.
+            Start of the window, inclusive. The window then ends now unless -Until says otherwise.
 
         .PARAMETER Until
-            End of the window, exclusive. Default: now.
+            End of the window, exclusive. On its own it means everything up to then - it does not
+            drag the default window along with it, so -Until X and -Since X tile exactly, with no
+            overlap and no gap between them.
+
+        .PARAMETER AllTime
+            Count every date, with no window at all. Cannot be combined with -Days, -Since or
+            -Until.
 
         .PARAMETER WorkItemType
             Only count these work item types, e.g. Bug, Task, 'User Story'.
@@ -1344,6 +1444,11 @@ function Get-AzureDevOpsClosedWorkItemCount {
             Get-AzureDevOpsClosedWorkItemCount -Project 'Business Central' |
                 Select-Object -First 10 ClosedBy, ClosedCount, WorkItemTypes
 
+        .EXAMPLE
+            Get-AzureDevOpsClosedWorkItemCount -AllTime
+
+            Every work item ever closed, rather than the last year.
+
         .OUTPUTS
             AzureDevOps.ClosedWorkItemCount objects carrying ClosedBy, ClosedByEmail, ClosedCount,
             Percent, ProjectCount, Projects, WorkItemTypes, FirstClosed and LastClosed.
@@ -1369,11 +1474,13 @@ function Get-AzureDevOpsClosedWorkItemCount {
         [string[]]$Project,
 
         [ValidateRange(1, 3650)]
-        [int]$Days = 365,
+        [Nullable[int]]$Days,
 
         [Nullable[datetime]]$Since,
 
         [Nullable[datetime]]$Until,
+
+        [switch]$AllTime,
 
         [string[]]$WorkItemType,
 
@@ -1389,8 +1496,10 @@ function Get-AzureDevOpsClosedWorkItemCount {
     )
 
     process {
+        $window = Resolve-DateWindowArgument -Days $Days -Since $Since -Until $Until -AllTime:$AllTime
+
         $items = @(Get-AzureDevOpsClosedWorkItem -Organization $Organization -Project $Project `
-                -Days $Days -Since $Since -Until $Until -WorkItemType $WorkItemType `
+                @window -WorkItemType $WorkItemType `
                 -ClosedBy $ClosedBy -PersonalAccessToken $PersonalAccessToken -ApiVersion $ApiVersion)
 
         $total = $items.Count
@@ -1465,6 +1574,11 @@ function Get-AzureDevOpsPullRequestCount {
             became of it afterwards - the Completed, Abandoned and Active columns break that down,
             and drafts are included unless -ExcludeDrafts is used.
 
+            The default window is the last year, not all of history: use -AllTime for that. Naming
+            one bound does not bring the default along with it, so splitting a range at a single
+            date - -Until '2026-01-01' for one half and -Since '2026-01-01' for the other - gives
+            two counts that sum to the whole.
+
             When grouping by person, people are matched on sign-in name where Azure DevOps supplies
             one and on display name otherwise, so a display name change does not split someone
             across two rows. Pull requests raised by a build identity or a service principal are
@@ -1499,14 +1613,20 @@ function Get-AzureDevOpsPullRequestCount {
             a pull request that has since been merged or abandoned was still created in the window.
 
         .PARAMETER Days
-            Size of the window ending now, in days. Default: 365, the last year. Ignored when
-            -Since is used.
+            Size of the window ending now, in days. Default: 365, the last year - applied only when
+            no date is named at all.
 
         .PARAMETER Since
-            Start of the window, inclusive. Overrides -Days.
+            Start of the window, inclusive. The window then ends now unless -Until says otherwise.
 
         .PARAMETER Until
-            End of the window, exclusive. Default: now.
+            End of the window, exclusive. On its own it means everything up to then - it does not
+            drag the default window along with it, so -Until X and -Since X tile exactly, with no
+            overlap and no gap between them.
+
+        .PARAMETER AllTime
+            Count every date, with no window at all. Cannot be combined with -Days, -Since or
+            -Until.
 
         .PARAMETER CreatedBy
             Only count pull requests whose author's display name or sign-in name contains this text.
@@ -1567,6 +1687,18 @@ function Get-AzureDevOpsPullRequestCount {
 
             Only the pull requests of one project that were merged.
 
+        .EXAMPLE
+            Get-AzureDevOpsPullRequestCount -AllTime
+
+            Every pull request ever raised, rather than the last year.
+
+        .EXAMPLE
+            $before = Get-AzureDevOpsPullRequestCount -Until '2026-01-01'
+            $after = Get-AzureDevOpsPullRequestCount -Since '2026-01-01'
+
+            Two halves that tile: the same boundary date on both, exclusive on one side and
+            inclusive on the other, so their totals sum to the -AllTime total.
+
         .OUTPUTS
             AzureDevOps.PullRequestCount objects carrying Name, GroupBy, PullRequestCount, Percent,
             Completed, Abandoned, Active, Draft, ProjectCount, Projects, FirstCreated and
@@ -1595,11 +1727,13 @@ function Get-AzureDevOpsPullRequestCount {
         [string]$Status = 'All',
 
         [ValidateRange(1, 3650)]
-        [int]$Days = 365,
+        [Nullable[int]]$Days,
 
         [Nullable[datetime]]$Since,
 
         [Nullable[datetime]]$Until,
+
+        [switch]$AllTime,
 
         [string]$CreatedBy,
 
@@ -1620,8 +1754,10 @@ function Get-AzureDevOpsPullRequestCount {
     )
 
     process {
+        $window = Resolve-DateWindowArgument -Days $Days -Since $Since -Until $Until -AllTime:$AllTime
+
         $pullRequests = @(Get-AzureDevOpsPullRequest -Organization $Organization -Project $Project `
-                -Status $Status -Days $Days -Since $Since -Until $Until `
+                -Status $Status @window `
                 -CreatedBy $CreatedBy -TargetBranch $TargetBranch -ExcludeDrafts:$ExcludeDrafts `
                 -PersonalAccessToken $PersonalAccessToken -ApiVersion $ApiVersion -PageSize $PageSize)
 
